@@ -1722,3 +1722,7 @@ UNSAFE_PROXY_RESPONSE_HEADERS: Final[frozenset[str]] = HTTP_FRAMING_HEADERS | BR
 # spend under the table's composite unique constraint.
 PTU_SENTINEL_API_KEY: str = "__ptu_flat_cost__"
 PTU_ROLLUP_JOB_ID: str = "ptu_flat_cost_rollup_job"
+PTU_ROLLUP_LOCK_TTL_SECONDS: int = 900
+# Furthest back the catch-up pass looks for unpriced PTU days when a deployment
+# declares no ptu_effective_from, bounding the scan for an open-ended window.
+PTU_ROLLUP_MAX_BACKFILL_DAYS: int = 90
