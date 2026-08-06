@@ -77,12 +77,30 @@ const normalizeUnderlyingModel = (model: string): string | null => {
   return stripped.toLowerCase() || null;
 };
 
+// A linear glob scan rather than a RegExp: patterns are admin-controlled model_name values, and a
+// backtracking regex built from one ("a*a*a*...") can freeze another admin's dashboard.
+const matchesWildcard = (pattern: string, name: string): boolean => {
+  const parts = pattern.split("*");
+  if (parts.length === 1) return pattern === name;
+  const head = parts[0];
+  const tail = parts[parts.length - 1];
+  if (!name.startsWith(head) || !name.endsWith(tail)) return false;
+  if (name.length < head.length + tail.length) return false;
+  const scanEnd = name.length - tail.length;
+  const scanResult = parts.slice(1, -1).reduce((searchFrom: number, part: string) => {
+    if (searchFrom < 0) return -1;
+    const found = name.indexOf(part, searchFrom);
+    return found === -1 || found + part.length > scanEnd ? -1 : found + part.length;
+  }, head.length);
+  return scanResult >= 0;
+};
+
 export const buildModelAvailability = (
   modelGroups: Iterable<string>,
   deployments: readonly DeploymentModelRef[],
 ): ModelAvailability => {
   const groups = new Set(modelGroups);
-  const entries = deployments
+  const literalEntries = deployments
     .filter((deployment) => groups.has(deployment.modelGroup))
     .flatMap((deployment) =>
       deployment.underlyingModels
@@ -90,6 +108,14 @@ export const buildModelAvailability = (
         .filter((key): key is string => key !== null)
         .map((key) => ({ key, modelGroup: deployment.modelGroup })),
     );
+  const wildcardPatterns = Array.from(
+    new Set(deployments.map((deployment) => deployment.modelGroup).filter((name) => name.includes("*"))),
+  );
+  const wildcardEntries = Array.from(groups)
+    .filter((group) => !group.includes("*") && wildcardPatterns.some((pattern) => matchesWildcard(pattern, group)))
+    .map((group) => ({ key: normalizeUnderlyingModel(group), modelGroup: group }))
+    .filter((entry): entry is { key: string; modelGroup: string } => entry.key !== null);
+  const entries = [...literalEntries, ...wildcardEntries];
   const grouped = new Map<string, Set<string>>();
   for (const entry of entries) {
     const groupsForKey = grouped.get(entry.key) ?? new Set<string>();
