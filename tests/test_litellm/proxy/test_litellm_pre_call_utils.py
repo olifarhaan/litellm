@@ -5835,6 +5835,7 @@ async def test_mcp_auth_chokepoint_refreshes_destinations_per_message(monkeypatc
     assert "await _refresh_request_otel_destinations(user_api_key_auth)" in chokepoint
 
 
+@pytest.mark.asyncio
 async def test_apply_admin_logging_exporters_needs_no_opentelemetry_when_flag_off(monkeypatch):
     """opentelemetry ships only in the proxy-runtime extra, so a litellm[proxy] install
     does not have it. Publishing the destination ContextVar imports it, and that call sat
