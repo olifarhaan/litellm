@@ -2391,6 +2391,16 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
         description="sends alerts if requests hang for 5min+",
     )
     ui_access_mode: Literal["admin_only", "all"] | None = Field("all", description="Control access to the Proxy UI")
+    login_rate_limit_max_failures: int | None = Field(
+        None,
+        ge=0,
+        description="Max failed Admin UI login attempts allowed from one source within `login_rate_limit_window_seconds`. Further attempts from that source are rejected with 429 before the password is checked. This rate limits a source, it does not lock an account. Set to 0 to disable. Defaults to 15",
+    )
+    login_rate_limit_window_seconds: int | None = Field(
+        None,
+        ge=1,
+        description="Fixed window in seconds over which failed Admin UI logins are counted. A throttled source is let back in one window after its FIRST failure in that window, so continued attempts do not extend the block. Defaults to 300",
+    )
     allowed_routes: list | None = Field(None, description="Proxy API Endpoints you want users to be able to access")
     reject_clientside_metadata_tags: bool | None = Field(
         None,

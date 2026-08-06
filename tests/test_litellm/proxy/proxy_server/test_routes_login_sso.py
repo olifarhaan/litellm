@@ -10,6 +10,7 @@ Routes covered:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -460,3 +461,310 @@ def test_login_form_ignores_open_redirect_return_to(client, monkeypatch):
     location = response.headers.get("location", "")
     assert "evil.example.com" not in location
     assert "/ui/" in location  # dashboard fallback
+
+
+# ---------------------------------------------------------------------------
+# Admin UI login rate limiting (LIT-5285)
+# ---------------------------------------------------------------------------
+
+_GOOD_PASSWORD = "correct-horse-battery-staple"
+
+
+class _StubRedis:
+    """Minimal stand-in for the coordination Redis."""
+
+    def __init__(self):
+        self.values: dict[str, int] = {}
+
+    async def async_get_cache(self, key, **kwargs):
+        return self.values.get(key)
+
+    async def async_increment(self, key, value, **kwargs):
+        self.values[key] = self.values.get(key, 0) + int(value)
+        return self.values[key]
+
+
+class _BrokenCache:
+    """A cache backend that is down. Every operation raises, like an open circuit breaker."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def async_get_cache(self, key, **kwargs):
+        self.calls += 1
+        raise Exception("Redis circuit breaker is open")
+
+    async def async_increment(self, key, value, **kwargs):
+        self.calls += 1
+        raise Exception("Redis circuit breaker is open")
+
+
+def _install_throttle_login_mocks(monkeypatch, **settings) -> list[str]:
+    """Patch authenticate_user so a wrong password raises the real 401 ProxyException.
+
+    Returns the list every credential comparison appends to, so a test can assert that
+    rejected attempts never reached the comparison at all.
+    """
+    from litellm.proxy import proxy_server as ps
+    from litellm.proxy._types import ProxyErrorTypes, ProxyException
+
+    attempted: list[str] = []
+
+    async def _fake_auth(username, password, master_key, prisma_client):
+        attempted.append(username)
+        if password == _GOOD_PASSWORD:
+            result = MagicMock()
+            result.user_id = "u-1"
+            result.user_email = "test@example.invalid"
+            result.user_role = "proxy_admin"
+            result.key = "sk-fake-ui-key"
+            return result
+        raise ProxyException(
+            message="Invalid credentials used to access UI.",
+            type=ProxyErrorTypes.auth_error,
+            param="invalid_credentials",
+            code=401,
+        )
+
+    def _fake_token_object(login_result, general_settings, premium_user):
+        return {"user_id": "u-1", "user_role": "proxy_admin", "key": "sk-fake-ui-key"}
+
+    monkeypatch.setattr("litellm.proxy.auth.login_utils.authenticate_user", _fake_auth)
+    monkeypatch.setattr("litellm.proxy.auth.login_utils.create_ui_token_object", _fake_token_object)
+    monkeypatch.setattr(ps, "master_key", "sk-test-master")
+    monkeypatch.setattr(ps, "general_settings", dict(settings))
+    monkeypatch.setattr(ps, "premium_user", False)
+    return attempted
+
+
+def _get_patched_authenticate():
+    from litellm.proxy.auth import login_utils
+
+    return login_utils.authenticate_user
+
+
+def _guess(client, username: str = "admin", password: str = "wrong") -> int:
+    return client.post("/v2/login", json={"username": username, "password": password}).status_code
+
+
+def test_seventeen_attempt_burst_is_cut_off_before_exhausting_the_list(client, monkeypatch, reset_login_throttle):
+    """LIT-5285 acceptance: replay the observed 17-attempt burst at the shipped defaults.
+
+    The run must be cut off at the 15 failure default, and the rejected attempts must
+    never reach the credential comparison.
+    """
+    attempted = _install_throttle_login_mocks(monkeypatch)
+
+    statuses = [_guess(client, password=f"guess-{i}") for i in range(17)]
+
+    assert statuses[:15] == [401] * 15
+    assert statuses[15:] == [429, 429]
+    assert len(attempted) == 15, "attempts past the limit must not reach the password check"
+
+
+def test_legitimate_user_mistyping_three_times_is_not_rate_limited(client, monkeypatch, reset_login_throttle):
+    """LIT-5285 acceptance: real-world noise sits well under the default, so a human who
+    fumbles a few times must still get in."""
+    attempted = _install_throttle_login_mocks(monkeypatch)
+
+    assert [_guess(client, password=f"typo-{i}") for i in range(3)] == [401, 401, 401]
+
+    response = client.post("/v2/login", json={"username": "admin", "password": _GOOD_PASSWORD})
+    assert response.status_code == 200
+    assert len(attempted) == 4
+
+
+def test_only_failed_attempts_count(client, monkeypatch, reset_login_throttle):
+    """A successful sign-in costs nothing, so an active dashboard user is never throttled
+    by their own logins no matter how many they make."""
+    _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=3)
+
+    for _ in range(20):
+        assert client.post("/v2/login", json={"username": "admin", "password": _GOOD_PASSWORD}).status_code == 200
+
+    assert [_guess(client) for _ in range(3)] == [401, 401, 401]
+    assert _guess(client) == 429
+
+
+def test_rate_limit_is_configurable_and_returns_retry_after(client, monkeypatch, reset_login_throttle):
+    """LIT-5285 acceptance: the limit and window are settings, and the 429 tells the
+    caller how long to wait."""
+    _install_throttle_login_mocks(
+        monkeypatch,
+        login_rate_limit_max_failures=2,
+        login_rate_limit_window_seconds=77,
+    )
+
+    assert [_guess(client) for _ in range(2)] == [401, 401]
+
+    blocked = client.post("/v2/login", json={"username": "admin", "password": "wrong"})
+    assert blocked.status_code == 429
+    assert blocked.headers.get("retry-after") == "77"
+    assert blocked.json()["error"]["param"] == "login_rate_limit"
+
+
+def test_rate_limit_can_be_disabled_with_zero(client, monkeypatch, reset_login_throttle):
+    """An operator who cannot tolerate the throttle can turn it off entirely."""
+    attempted = _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=0)
+
+    assert [_guess(client, password=f"guess-{i}") for i in range(20)] == [401] * 20
+    assert len(attempted) == 20
+
+
+def test_rate_limit_covers_form_login_and_the_fallback_login_page(client, monkeypatch, reset_login_throttle):
+    """LIT-5285 acceptance: every login surface is covered, so a throttled source cannot
+    switch endpoints. The no-JS form page must answer in HTML, not a JSON error envelope."""
+    _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=2)
+
+    assert [_guess(client) for _ in range(2)] == [401, 401]
+
+    form_login = client.post("/login", data={"username": "admin", "password": "wrong"}, follow_redirects=False)
+    assert form_login.status_code == 429
+
+    page = client.get("/fallback/login")
+    assert page.status_code == 429
+    assert page.headers.get("content-type", "").startswith("text/html")
+    assert page.headers.get("retry-after") is not None
+    assert "Too many failed login attempts" in page.text
+
+
+def test_rate_limit_covers_v3_login(client, monkeypatch, reset_login_throttle):
+    """The control-plane login path shares the same counter."""
+    _install_throttle_login_mocks(
+        monkeypatch,
+        login_rate_limit_max_failures=2,
+        control_plane_url="https://cp.example.com",
+    )
+
+    for _ in range(2):
+        assert client.post("/v3/login", json={"username": "admin", "password": "wrong"}).status_code == 401
+
+    assert client.post("/v3/login", json={"username": "admin", "password": "wrong"}).status_code == 429
+
+
+def test_a_username_spray_from_one_source_is_still_stopped(client, monkeypatch, reset_login_throttle):
+    """Credential stuffing rotates the username. The counter is keyed on the source, so
+    rotating the username buys the attacker nothing."""
+    attempted = _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=4)
+
+    statuses = [_guess(client, username=f"victim-{i}@example.invalid") for i in range(6)]
+
+    assert statuses == [401, 401, 401, 401, 429, 429]
+    assert len(attempted) == 4
+
+
+def test_a_concurrent_burst_cannot_race_past_the_limit(client, monkeypatch, reset_login_throttle):
+    """Regression: the attempt must be counted before the password is checked.
+
+    Reading the counter, then verifying the password, then incrementing let every request
+    in a parallel burst observe the same pre-increment value. 100 concurrent guesses all
+    reached the credential comparison against a limit of 5.
+    """
+    import anyio
+
+    attempted = _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=5)
+    original = _get_patched_authenticate()
+
+    async def _slow_auth(username, password, master_key, prisma_client):
+        await anyio.sleep(0.01)
+        return await original(username, password, master_key, prisma_client)
+
+    monkeypatch.setattr("litellm.proxy.auth.login_utils.authenticate_user", _slow_auth)
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        statuses = list(pool.map(lambda i: _guess(client, password=f"race-{i}"), range(40)))
+
+    assert len(attempted) <= 5, f"{len(attempted)} password checks got through a limit of 5"
+    assert statuses.count(429) == 40 - len(attempted)
+
+
+def test_config_error_does_not_consume_the_attempt_budget(client, monkeypatch, reset_login_throttle):
+    """A 500 from a missing master key is a misconfiguration, not a password guess, so it
+    must not push a legitimate operator toward the limit."""
+    from litellm.proxy._types import ProxyErrorTypes, ProxyException
+
+    _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=2)
+
+    async def _misconfigured(username, password, master_key, prisma_client):
+        raise ProxyException(
+            message="Master Key not set for Proxy.",
+            type=ProxyErrorTypes.auth_error,
+            param="master_key",
+            code=500,
+        )
+
+    monkeypatch.setattr("litellm.proxy.auth.login_utils.authenticate_user", _misconfigured)
+
+    assert [_guess(client) for _ in range(5)] == [500] * 5
+
+
+def test_an_http_exception_401_also_counts(client, monkeypatch, reset_login_throttle):
+    """authenticate_user raises a bare HTTPException(401) on the EXPERIMENTAL_UI_LOGIN path."""
+    from fastapi import HTTPException
+
+    _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=2)
+
+    async def _http_401(username, password, master_key, prisma_client):
+        raise HTTPException(status_code=401, detail={"error": "User Information is required"})
+
+    monkeypatch.setattr("litellm.proxy.auth.login_utils.authenticate_user", _http_401)
+
+    assert [_guess(client) for _ in range(2)] == [401, 401]
+    assert _guess(client) == 429
+
+
+def test_login_still_works_when_the_counter_cache_is_down(client, monkeypatch, reset_login_throttle):
+    """Regression: the rate limit must fail OPEN.
+
+    A degraded coordination Redis raises out of the circuit breaker on the counter path.
+    Propagating that turned a Redis outage into a 500 on every Admin UI login, correct
+    password included, locking the operator out of their own dashboard.
+    """
+    from litellm.proxy import proxy_server as ps
+
+    broken = _BrokenCache()
+    _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=2)
+    monkeypatch.setattr(ps, "redis_usage_cache", broken)
+
+    assert _guess(client) == 401
+    assert client.post("/v2/login", json={"username": "admin", "password": _GOOD_PASSWORD}).status_code == 200
+    assert broken.calls > 0, "the test must actually exercise the broken backend"
+
+
+def test_login_rate_limiter_follows_the_live_coordination_redis(monkeypatch, reset_login_throttle):
+    """The counter must land in the same Redis the rest of the proxy coordinates through,
+    and must keep following it rather than latching onto whatever was set first."""
+    from litellm.proxy import proxy_server as ps
+
+    shared = _StubRedis()
+    monkeypatch.setattr(ps, "redis_usage_cache", shared)
+    assert ps._login_rate_limiter().redis_cache is shared
+
+    monkeypatch.setattr(ps, "redis_usage_cache", None)
+    assert ps._login_rate_limiter().redis_cache is None
+
+
+def test_the_local_counter_tier_is_never_backed_by_redis(reset_login_throttle):
+    """The shared tier is injected separately, so DualCache never backfills a Redis read
+    into the local tier with its own TTL and cannot serve a stale copy."""
+    from litellm.proxy import proxy_server as ps
+
+    assert ps.login_rate_limit_cache.redis_cache is None
+
+
+def test_the_no_js_form_post_is_throttled_in_html_not_json(client, monkeypatch, reset_login_throttle):
+    """The sign-in form posts to /login, so that is where a throttled browser lands.
+
+    login_rate_limited_html was written for this audience but only the GET page used it,
+    so a no-JS user saw a raw JSON error envelope.
+    """
+    _install_throttle_login_mocks(monkeypatch, login_rate_limit_max_failures=2)
+
+    assert [_guess(client) for _ in range(2)] == [401, 401]
+
+    response = client.post("/login", data={"username": "admin", "password": "wrong"}, follow_redirects=False)
+    assert response.status_code == 429
+    assert response.headers.get("content-type", "").startswith("text/html")
+    assert response.headers.get("retry-after") is not None
+    assert "Too many failed login attempts" in response.text
+    assert "error" not in response.text.lower().split("<body")[0]

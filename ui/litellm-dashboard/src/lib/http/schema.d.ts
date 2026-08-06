@@ -23508,6 +23508,16 @@ export interface components {
             /** @description key manager to load keys from / decrypt keys with */
             key_management_system?: components["schemas"]["KeyManagementSystem"] | null;
             /**
+             * Login Rate Limit Max Failures
+             * @description Max failed Admin UI login attempts allowed from one source within `login_rate_limit_window_seconds`. Further attempts from that source are rejected with 429 before the password is checked. This rate limits a source, it does not lock an account. Set to 0 to disable. Defaults to 15
+             */
+            login_rate_limit_max_failures?: number | null;
+            /**
+             * Login Rate Limit Window Seconds
+             * @description Fixed window in seconds over which failed Admin UI logins are counted. A throttled source is let back in one window after its FIRST failure in that window, so continued attempts do not extend the block. Defaults to 300
+             */
+            login_rate_limit_window_seconds?: number | null;
+            /**
              * Master Key
              * @description require a key for all calls to proxy
              */

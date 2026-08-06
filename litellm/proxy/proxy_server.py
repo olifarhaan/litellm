@@ -17,7 +17,7 @@ import traceback
 import warnings
 from collections.abc import AsyncGenerator, Callable, Mapping
 from datetime import datetime, timedelta, timezone
-from types import UnionType
+from types import MappingProxyType, UnionType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -274,6 +274,13 @@ from litellm.proxy.auth.auth_utils import (
 )
 from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy.auth.litellm_license import LicenseCheck
+from litellm.proxy.auth.login_rate_limit import (
+    DEFAULT_LOGIN_RATE_LIMIT_WINDOW_SECONDS,
+    LoginRateLimiter,
+    enforce_login_rate_limit,
+    login_rate_limit_config,
+    login_rate_limited_html,
+)
 from litellm.proxy.auth.model_checks import (
     expand_wildcard_deployments_for_model_info,
     get_all_fallbacks,
@@ -673,6 +680,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
     FileResponse,
+    HTMLResponse,
     JSONResponse,
     ORJSONResponse,
     RedirectResponse,
@@ -2047,6 +2055,7 @@ user_api_key_cache: UserApiKeyCache = UserApiKeyCache(
 )
 spend_counter_cache: Final = DualCache(default_in_memory_ttl=UserAPIKeyCacheTTLEnum.in_memory_cache_ttl.value)
 cli_sso_session_cache: Final = DualCache(default_in_memory_ttl=CLI_SSO_SESSION_TTL_SECONDS)
+login_rate_limit_cache: Final = DualCache(default_in_memory_ttl=DEFAULT_LOGIN_RATE_LIMIT_WINDOW_SECONDS)
 model_max_budget_limiter: Final = _PROXY_VirtualKeyModelMaxBudgetLimiter(dual_cache=user_api_key_cache)
 litellm.logging_callback_manager.add_litellm_callback(model_max_budget_limiter)
 redis_usage_cache: RedisCache | None = None  # redis cache used for tracking spend, tpm/rpm limits
@@ -6055,6 +6064,12 @@ class ProxyConfig:
         ## UI ACCESS MODE ##
         if "ui_access_mode" in _general_settings:
             general_settings["ui_access_mode"] = _general_settings["ui_access_mode"]
+
+        if "login_rate_limit_max_failures" in _general_settings:
+            general_settings["login_rate_limit_max_failures"] = _general_settings["login_rate_limit_max_failures"]
+
+        if "login_rate_limit_window_seconds" in _general_settings:
+            general_settings["login_rate_limit_window_seconds"] = _general_settings["login_rate_limit_window_seconds"]
 
         ## STORE PROMPTS IN SPEND LOGS ##
         if "store_prompts_in_spend_logs" in _general_settings:
@@ -13772,6 +13787,19 @@ async def async_queue_request(
         )
 
 
+def _login_rate_limiter() -> LoginRateLimiter:
+    """Build the failed-login throttle from the live proxy settings and shared cache.
+
+    Reads ``redis_usage_cache`` on every call rather than latching onto it once, so the
+    counters always follow the coordination Redis the rest of the proxy is using.
+    """
+    return LoginRateLimiter(
+        cache=login_rate_limit_cache,
+        config=login_rate_limit_config(general_settings),
+        redis_cache=redis_usage_cache,
+    )
+
+
 @app.get("/fallback/login", tags=["experimental"], include_in_schema=False)
 async def fallback_login(request: Request):
     """
@@ -13781,14 +13809,20 @@ async def fallback_login(request: Request):
     """
     from litellm.proxy.proxy_server import ui_link
 
+    login_limiter: Final = _login_rate_limiter()
+    if await login_limiter.is_rate_limited(request=request):
+        return HTMLResponse(
+            content=login_rate_limited_html(login_limiter.retry_after_seconds),
+            status_code=429,
+            headers=MappingProxyType({"retry-after": str(login_limiter.retry_after_seconds)}),
+        )
+
     # get url from request
     redirect_url = get_custom_url(str(request.base_url))
     if redirect_url.endswith("/"):
         redirect_url += "sso/callback"
     else:
         redirect_url += "/sso/callback"
-
-    from fastapi.responses import HTMLResponse
 
     hide_default_credentials_hint: Final = (
         os.getenv("LITELLM_HIDE_DEFAULT_CREDENTIALS_HINT", "false").lower() == "true"
@@ -13814,12 +13848,26 @@ async def login(request: Request):
     password: Final = str(form.get("password"))
 
     # Authenticate user and get login result
-    login_result: Final = await authenticate_user(
-        username=username,
-        password=password,
-        master_key=master_key,
-        prisma_client=prisma_client,
-    )
+    login_limiter: Final = _login_rate_limiter()
+    try:
+        login_result: Final = await enforce_login_rate_limit(
+            request=request,
+            limiter=login_limiter,
+            authenticate=lambda: authenticate_user(
+                username=username,
+                password=password,
+                master_key=master_key,
+                prisma_client=prisma_client,
+            ),
+        )
+    except ProxyException as exc:
+        if exc.code != str(status.HTTP_429_TOO_MANY_REQUESTS):
+            raise
+        return HTMLResponse(
+            content=login_rate_limited_html(login_limiter.retry_after_seconds),
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers=MappingProxyType({"retry-after": str(login_limiter.retry_after_seconds)}),
+        )
 
     # Create UI token object
     returned_ui_token_object: Final = create_ui_token_object(
@@ -13891,11 +13939,15 @@ async def login_v2(request: Request):
         username: Final = str(body.get("username"))
         password: Final = str(body.get("password"))
 
-        login_result: Final = await authenticate_user(
-            username=username,
-            password=password,
-            master_key=master_key,
-            prisma_client=prisma_client,
+        login_result: Final = await enforce_login_rate_limit(
+            request=request,
+            limiter=_login_rate_limiter(),
+            authenticate=lambda: authenticate_user(
+                username=username,
+                password=password,
+                master_key=master_key,
+                prisma_client=prisma_client,
+            ),
         )
 
         returned_ui_token_object: Final = create_ui_token_object(
@@ -13923,6 +13975,8 @@ async def login_v2(request: Request):
         json_response.set_cookie(key="token", value=jwt_token)
         return json_response
     except Exception as e:
+        if isinstance(e, ProxyException) and e.code == str(status.HTTP_429_TOO_MANY_REQUESTS):
+            raise
         verbose_proxy_logger.exception("litellm.proxy.proxy_server.login_v2(): Exception occurred - %s", e)
         if isinstance(e, ProxyException):
             raise e
@@ -13964,11 +14018,15 @@ async def login_v3(request: Request):
         username: Final = str(body.get("username"))
         password: Final = str(body.get("password"))
 
-        login_result: Final = await authenticate_user(
-            username=username,
-            password=password,
-            master_key=master_key,
-            prisma_client=prisma_client,
+        login_result: Final = await enforce_login_rate_limit(
+            request=request,
+            limiter=_login_rate_limiter(),
+            authenticate=lambda: authenticate_user(
+                username=username,
+                password=password,
+                master_key=master_key,
+                prisma_client=prisma_client,
+            ),
         )
 
         returned_ui_token_object: Final = create_ui_token_object(
@@ -14000,6 +14058,8 @@ async def login_v3(request: Request):
             status_code=status.HTTP_200_OK,
         )
     except Exception as e:
+        if isinstance(e, ProxyException) and e.code == str(status.HTTP_429_TOO_MANY_REQUESTS):
+            raise
         verbose_proxy_logger.exception("litellm.proxy.proxy_server.login_v3(): Exception occurred - %s", e)
         if isinstance(e, ProxyException):
             raise e
@@ -15383,6 +15443,9 @@ async def _reset_general_settings_ui_litellm_field(field_name: str, user_api_key
     return {"message": f"Field {field_name} reset", "status": "success"}
 
 
+_INTEGER_SETTING_FIELD: Final = MappingProxyType({"type": "Integer"})
+
+
 @router.get(
     "/config/list",
     tags=["config.yaml"],
@@ -15446,6 +15509,8 @@ async def get_config_list(
         "mcp_required_fields": {"type": "List"},
         "cancel_on_disconnect": {"type": "Boolean"},
         "disable_auto_add_proxy_admin_to_teams": {"type": "Boolean"},
+        "login_rate_limit_max_failures": _INTEGER_SETTING_FIELD,
+        "login_rate_limit_window_seconds": _INTEGER_SETTING_FIELD,
     }
 
     return_val: Final = []

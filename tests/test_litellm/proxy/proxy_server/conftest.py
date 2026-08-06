@@ -511,3 +511,20 @@ def make_key(
         max_budget=max_budget,
         **kwargs,
     )
+
+
+@pytest.fixture(autouse=True)
+def reset_login_throttle(monkeypatch):
+    """Give every test its own Admin UI login failure counters.
+
+    `client` is session scoped and the counters live in a module global with a 300s
+    window, so without this any test that fails a login enough times would start
+    returning 429 from unrelated tests later in the same process.
+    """
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy import proxy_server as ps
+
+    cache = DualCache()
+    monkeypatch.setattr(ps, "login_rate_limit_cache", cache)
+    monkeypatch.setattr(ps, "redis_usage_cache", None)
+    return cache

@@ -11213,3 +11213,62 @@ async def test_setup_prisma_client_returns_none_when_connect_itself_fails(monkey
     assert result is None
     assert mock_client.start_db_health_watchdog_task.await_count == 0
     assert mock_client.health_check.await_count == 0
+
+
+def test_get_config_list_includes_login_rate_limit_settings(monkeypatch):
+    """LIT-5285: the login throttle knobs must be reachable from the Admin UI.
+
+    That needs both the ConfigGeneralSettings fields and the allowed_args entries in
+    get_config_list; missing either silently hides them from the dashboard."""
+    import types
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi.testclient import TestClient
+
+    import litellm.proxy.proxy_server as ps
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.proxy_server import app
+
+    mock_prisma = MagicMock()
+    mock_config_table = MagicMock()
+    mock_config_table.find_first = AsyncMock(return_value=None)
+    mock_prisma.db = types.SimpleNamespace(litellm_config=mock_config_table)
+    monkeypatch.setattr(ps, "prisma_client", mock_prisma)
+    previous_overrides = dict(app.dependency_overrides)
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        user_id="admin", user_role=LitellmUserRoles.PROXY_ADMIN
+    )
+    try:
+        client = TestClient(app)
+        resp = client.get("/config/list", params={"config_type": "general_settings"})
+        assert resp.status_code == 200, resp.text
+        fields = {item["field_name"]: item for item in resp.json()}
+        assert fields["login_rate_limit_max_failures"]["field_type"] == "Integer"
+        assert fields["login_rate_limit_window_seconds"]["field_type"] == "Integer"
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous_overrides)
+
+
+@pytest.mark.asyncio
+async def test_update_general_settings_applies_login_rate_limit_from_db():
+    """LIT-5285: a threshold saved from the dashboard must reach the running proxy.
+
+    _update_general_settings copies an explicit allowlist of keys out of the DB row, so a
+    key that is missing from it renders a control that saves and then does nothing."""
+    import litellm.proxy.proxy_server as ps
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    original = dict(ps.general_settings)
+    try:
+        await ProxyConfig()._update_general_settings(
+            db_general_settings={
+                "login_rate_limit_max_failures": 3,
+                "login_rate_limit_window_seconds": 45,
+            }
+        )
+        assert ps.general_settings["login_rate_limit_max_failures"] == 3
+        assert ps.general_settings["login_rate_limit_window_seconds"] == 45
+    finally:
+        ps.general_settings.clear()
+        ps.general_settings.update(original)
